@@ -71,7 +71,11 @@ jobs:
 
       - name: Run Forge
         id: forge
-        uses: hoangsonww/Forge-Agentic-Coding-CLI/actions/forge-run@v1.0.1
+        # Reference must be @master: the action only exists on master. Tag
+        # v1.0.1 predates it, and the runner fails with "Can't find 'action.yml'
+        # ... for action '.../actions/forge-run@v1.0.1'" (verified). There is
+        # also no `v1` tag — upstream tags are v0.1.0/v0.1.1/v1.0.0/v1.0.1.
+        uses: hoangsonww/Forge-Agentic-Coding-CLI/actions/forge-run@master
         with:
           task: ${{ github.event.inputs.task || 'Review this repository and produce a short plan listing the three highest-value improvements.' }}
           mode: ${{ github.event.inputs.mode || 'plan' }}
