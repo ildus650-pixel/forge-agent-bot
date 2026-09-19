@@ -13,7 +13,8 @@ name: Forge Agent
 #     prompt, so it cannot run unattended in CI. Its GHCR image is also private
 #     (anonymous token -> 403). That path is documented, not wired, below.
 #
-# Free model path used here: Forge's `openai-compat` provider pointed at Z.AI.
+# Free model path used here: Forge's `openai` provider pointed at Z.AI's
+# OpenAI-compatible endpoint.
 # Forge documents the override as OPENAI_BASE_URL + OPENAI_API_KEY, and Z.AI
 # serves glm-4.5-flash at $0 input / $0 output.
 
@@ -61,7 +62,8 @@ jobs:
           set -euo pipefail
           npm install -g @hoangsonw/forge
           forge --version
-          forge config set provider openai-compat
+          forge config set provider openai   # CLI provider names: ollama|anthropic|openai|llamacpp|vllm|lmstudio
+          # "openai-compat" (the README wording) is NOT accepted by the CLI.
           # pin the free Z.AI model on every role the router uses
           for role in architect planner executor reviewer debugger fast code; do
             forge config set "models.${role}" glm-4.5-flash 2>/dev/null || true
@@ -79,7 +81,7 @@ jobs:
         with:
           task: ${{ github.event.inputs.task || 'Review this repository and produce a short plan listing the three highest-value improvements.' }}
           mode: ${{ github.event.inputs.mode || 'plan' }}
-          provider: "openai-compat"
+          provider: "openai"
           fail-on-error: "false"
           cache-forge-home: "true"
 
