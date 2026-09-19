@@ -2,21 +2,28 @@ name: Forge Agent
 
 # Forge (hoangsonww/Forge-Agentic-Coding-CLI) running on GitHub Actions.
 #
-# Corrections vs. the original spec — verified against the upstream repos:
-#   * the action tag `@v1` does NOT exist; upstream tags are
-#     v0.1.0 / v0.1.1 / v1.0.0 / v1.0.1, so this pins `@v1.0.1`.
+# Corrections vs. the original spec — each verified against upstream:
+#   * There is no `@v1` tag (upstream tags: v0.1.0/v0.1.1/v1.0.0/v1.0.1), and the
+#     action file exists only on `master` — tagging v1.0.1 predates it. The
+#     runner fails with "Can't find 'action.yml' ... @v1.0.1", so `@master` is used.
 #   * `Omar-Azam/forge-agent` and `hoangsonww/Forge-Agentic-Coding-CLI` are two
-#     different projects that share the "Forge" name. Only the latter ships a
-#     GitHub Action, and it is the one used here.
+#     different projects sharing the "Forge" name. Only the latter ships a GitHub
+#     Action, and it is the one wired here.
 #   * Omar-Azam's agent drives the *free web UIs* of DeepSeek/ChatGPT/Gemini via
 #     Playwright and stops on an interactive "LOGIN REQUIRED ... press ENTER"
 #     prompt, so it cannot run unattended in CI. Its GHCR image is also private
-#     (anonymous token -> 403). That path is documented, not wired, below.
+#     (anonymous pull -> 403). That path is documented, not wired.
+#   * The CLI provider value is `openai`, not `openai-compat` (README wording).
 #
-# Free model path used here: Forge's `openai` provider pointed at Z.AI's
-# OpenAI-compatible endpoint.
-# Forge documents the override as OPENAI_BASE_URL + OPENAI_API_KEY, and Z.AI
-# serves glm-4.5-flash at $0 input / $0 output.
+# Free model path used here: a local model via Ollama. No API key, no cost, no
+# network dependency on a third-party inference provider.
+#
+# Why not a free hosted model: Z.AI's OpenAI-compatible endpoint serves the free
+# glm-4.5-flash but is unreliable for Forge — measured 200 OK in 9.5 s with an
+# empty `content` (the tokens land in the reasoning channel) and outright hangs
+# on retry, which Forge reports as `HeadersTimeoutError` and silently degrades to
+# a canned fallback plan. Z.AI also rejects the paid `glm-4.5` with
+# `429 Insufficient balance`. A local model removes that failure mode entirely.
 
 on:
   schedule:
@@ -44,12 +51,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
-    env:
-      # Z.AI exposes an OpenAI-compatible endpoint; this is what Forge's
-      # openai-compat provider talks to.
-      OPENAI_BASE_URL: "https://api.z.ai/api/paas/v4"
-      OPENAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-
     steps:
       - uses: actions/checkout@v4
 
@@ -57,19 +58,37 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Pre-configure Forge (provider + free model)
+      - name: Install and start local model (Ollama)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://ollama.com/install.sh | sh
+          nohup ollama serve > /tmp/ollama.log 2>&1 &
+          for i in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+              echo "ollama up after ~$((i*3))s"; break
+            fi
+            sleep 3
+          done
+          ollama pull qwen2.5-coder:1.5b
+          ollama list
+          curl -sf http://127.0.0.1:11434/api/tags | head -c 400; echo
+
+      - name: Pre-configure Forge (local provider, no API key)
         run: |
           set -euo pipefail
           npm install -g @hoangsonw/forge
           forge --version
-          forge config set provider openai   # CLI provider names: ollama|anthropic|openai|llamacpp|vllm|lmstudio
-          # "openai-compat" (the README wording) is NOT accepted by the CLI.
-          # pin the free Z.AI model on every role the router uses
-          for role in architect planner executor reviewer debugger fast code; do
-            forge config set "models.${role}" glm-4.5-flash 2>/dev/null || true
+          # CLI-accepted provider names: ollama|anthropic|openai|llamacpp|vllm|lmstudio
+          # ("openai-compat" is README wording, not a CLI value.)
+          forge config set provider ollama
+          for role in architect planner executor reviewer debugger fast code models.planner models.code models.fast; do
+            forge config set "${role}" qwen2.5-coder:1.5b 2>/dev/null || true
+          done
+          for role in planner code fast; do
+            forge config set "models.${role}" qwen2.5-coder:1.5b 2>/dev/null || true
           done
           echo "--- provider probe ---"
-          forge model list 2>&1 | head -25 || true
+          forge model list 2>&1 | head -30 || true
 
       - name: Run Forge
         id: forge
@@ -81,7 +100,7 @@ jobs:
         with:
           task: ${{ github.event.inputs.task || 'Review this repository and produce a short plan listing the three highest-value improvements.' }}
           mode: ${{ github.event.inputs.mode || 'plan' }}
-          provider: "openai"
+          provider: "ollama"
           fail-on-error: "false"
           cache-forge-home: "true"
 
