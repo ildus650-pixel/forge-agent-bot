@@ -1,0 +1,137 @@
+name: Forge Agent
+
+# Forge (hoangsonww/Forge-Agentic-Coding-CLI) running on GitHub Actions.
+#
+# Corrections vs. the original spec — verified against the upstream repos:
+#   * the action tag `@v1` does NOT exist; upstream tags are
+#     v0.1.0 / v0.1.1 / v1.0.0 / v1.0.1, so this pins `@v1.0.1`.
+#   * `Omar-Azam/forge-agent` and `hoangsonww/Forge-Agentic-Coding-CLI` are two
+#     different projects that share the "Forge" name. Only the latter ships a
+#     GitHub Action, and it is the one used here.
+#   * Omar-Azam's agent drives the *free web UIs* of DeepSeek/ChatGPT/Gemini via
+#     Playwright and stops on an interactive "LOGIN REQUIRED ... press ENTER"
+#     prompt, so it cannot run unattended in CI. Its GHCR image is also private
+#     (anonymous token -> 403). That path is documented, not wired, below.
+#
+# Free model path used here: Forge's `openai-compat` provider pointed at Z.AI.
+# Forge documents the override as OPENAI_BASE_URL + OPENAI_API_KEY, and Z.AI
+# serves glm-4.5-flash at $0 input / $0 output.
+
+on:
+  schedule:
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Task for Forge. Leave empty for the default plan-mode review."
+        required: false
+        default: ""
+      mode:
+        description: "plan (read-only) | balanced | risky"
+        required: false
+        default: "plan"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: forge-agent
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      # Z.AI exposes an OpenAI-compatible endpoint; this is what Forge's
+      # openai-compat provider talks to.
+      OPENAI_BASE_URL: "https://api.z.ai/api/paas/v4"
+      OPENAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Pre-configure Forge (provider + free model)
+        run: |
+          set -euo pipefail
+          npm install -g @hoangsonw/forge
+          forge --version
+          forge config set provider openai-compat
+          # pin the free Z.AI model on every role the router uses
+          for role in architect planner executor reviewer debugger fast code; do
+            forge config set "models.${role}" glm-4.5-flash 2>/dev/null || true
+          done
+          echo "--- provider probe ---"
+          forge model list 2>&1 | head -25 || true
+
+      - name: Run Forge
+        id: forge
+        uses: hoangsonww/Forge-Agentic-Coding-CLI/actions/forge-run@v1.0.1
+        with:
+          task: ${{ github.event.inputs.task || 'Review this repository and produce a short plan listing the three highest-value improvements.' }}
+          mode: ${{ github.event.inputs.mode || 'plan' }}
+          provider: "openai-compat"
+          fail-on-error: "false"
+          cache-forge-home: "true"
+
+      - name: Show Forge outputs
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "Forge task ID: ${{ steps.forge.outputs.task-id }}"
+            echo "success      : ${{ steps.forge.outputs.success }}"
+            echo "summary      : ${{ steps.forge.outputs.summary }}"
+            echo "files-changed: ${{ steps.forge.outputs.files-changed }}"
+            echo "duration-ms  : ${{ steps.forge.outputs.duration-ms }}"
+            echo "cost-usd     : ${{ steps.forge.outputs.cost-usd }}"
+            echo "log-path     : ${{ steps.forge.outputs.log-path }}"
+          } | tee /tmp/forge_summary.txt
+          if [ -n "${{ steps.forge.outputs.log-path }}" ] && [ -f "${{ steps.forge.outputs.log-path }}" ]; then
+            echo "--- log tail ---"
+            tail -80 "${{ steps.forge.outputs.log-path }}" | tee /tmp/forge_log_tail.txt || true
+          fi
+
+      - name: Send result to Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -uo pipefail
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "::warning::telegram secrets missing - skipping notify"
+            exit 0
+          fi
+          { cat /tmp/forge_summary.txt 2>/dev/null; echo; cat /tmp/forge_log_tail.txt 2>/dev/null; } > /tmp/msg.txt
+          python3 scripts/notify.py /tmp/msg.txt "Forge Agent" || true
+
+      - name: Commit result
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p runs
+          STAMP="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+          {
+            echo "# Forge run — ${STAMP}"
+            echo
+            echo '```'
+            cat /tmp/forge_summary.txt 2>/dev/null || echo "(no summary)"
+            echo '```'
+          } > "runs/${STAMP}.md"
+          git config user.name  "forge-agent[bot]"
+          git config user.email "forge-agent@users.noreply.github.com"
+          if [ -z "$(git status --porcelain runs/ 2>/dev/null)" ]; then
+            echo "nothing to commit"; exit 0
+          fi
+          git add -f runs/
+          git commit -q -m "run: forge ${STAMP} [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase -q --autostash origin main && git push -q && break
+            echo "push attempt $i failed, retrying"; sleep 5
+          done
